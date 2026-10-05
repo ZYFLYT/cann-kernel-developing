@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/add_custom.dir/host/kernel_host.cpp.o -o add_custom   -L/home/cann/Ascend/cann-9.1.1/lib64  -Wl,-rpath,/home/cann/Ascend/cann-9.1.1/lib64 -lacl -laclrt 

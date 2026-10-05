@@ -1,0 +1,3 @@
+/home/cann/MyFirstAscendCOP/build/CMakeFiles/add_custom.dir
+/home/cann/MyFirstAscendCOP/build/CMakeFiles/edit_cache.dir
+/home/cann/MyFirstAscendCOP/build/CMakeFiles/rebuild_cache.dir

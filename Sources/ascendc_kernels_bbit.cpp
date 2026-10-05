@@ -74,12 +74,12 @@ private:
    AscendC::TPipe pipe;// TPipe：CANN管道管理对象，用来创建流水线、管理MTE DMA搬运任务
    AscendC::TQueue<AscendC::Tposition::VECIN,BUFFER_NUM> inQueueX,inQueueY;
    // 输出队列，TPosition::VECOUT，给CopyOut用（UB搬运回GM）
-   AscendC::Tqueue<AscendC::Tposition::VECOUT,BUFFER_NUM> outQueueZ;
+   AscendC::TQueue<AscendC::Tposition::VECOUT,BUFFER_NUM> outQueueZ;
 
    // GlobalTensor：CANN封装的GM全局显存张量对象，代替原始GM_ADDR指针，方便地址偏移
-   AscendC::GlobalTenser<half> xGm;// 输入X，GM显存张量
-   AscendC::GlobalTenser<half> yGm;
-   AscendC::GlobalTenser<half> zGm;
+   AscendC::GlobalTensor<half> xGm;// 输入X，GM显存张量
+   AscendC::GlobalTensor<half> yGm;
+   AscendC::GlobalTensor<half> zGm;
 
    uint32_t blockLength; // 每个核的计算数据长度
    uint32_t tileNum;     // 当前AI Core一共要处理多少个tile小块（来自Tiling）
@@ -109,3 +109,58 @@ __aicore__ inline void KernelAdd::Init(GM_ADDR x,GM_ADDR y, GM_ADDR z,uint32_t t
    pipe.InitBuffer(outQueueZ,BUFFER_NUM,this->tileLength*sizeof(float));
 }
 
+__aicore__ inline void KernelAdd::Process(){
+   uint32_t loopCount = this->tileNum*BUFFER_NUM;
+   for(int i=0;i<loopCount;i++){
+      CopyIn(i);
+      Compute(i);
+      CopyOut(i);
+   }
+}
+
+__aicore__ inline void KernelAdd::CopyIn(uint32_t progress){
+   // ---------------------- 1. 从队列中申请片上本地内存LocalTensor ----------------------
+   // LocalTensor 代表AI Core内部高速片上内存LM，矢量计算只能在LM上执行，容量很小
+   AscendC::LocalTensor<float> xLocal = InQueueX.AllocTensor<float>();
+   AscendC::LocalTensor<float> yLocal = InQueueY.AllocTensor<float>();
+
+   // ---------------------- 2. DataCopy：NPU硬件搬运指令 GM -> LM ----------------------
+   // progress：当前是第几个tile块；progress * tileLength 计算该块在全局内存中的起始偏移
+   // xGm/yGm：Global Memory上存放的输入张量（NPU全局显存，容量大、访问慢）
+   // tileLength：当前tile块包含多少个float元素
+   AscendC::DataCopy(xLocal,xGm[progress*this->tileLength],this->tileLength);
+   AscendC::DataCopy(yLocal,yGm[progress*this->tileLength],this->tileLength);
+
+   // ---------------------- 3. EnQue 入队，交给计算流水线 ----------------------
+   // EnQue = Enqueue，把准备好的本地张量送入VECIN计算队列
+   // 通知Compute单元：这块数据已经搬运完成，可以拿去做矢量计算
+   InQueueX.EnQue(xLocal);
+   InQueueY.EnQue(yLocal);
+}
+
+__aicore__ inline void KernelAdd::Compute(uint32_t progress){
+   // DeQue<float>()：无入参模板函数，只返回LocalTensor，编译器无法推导，必须显式写<float>
+   AscendC::LocalTensor<float> xLocal = InQueueX.DeQue<float>();
+   AscendC::LocalTensor<float> yLocal = InQueueY.DeQue<float>();
+   // AllocTensor<float>()：申请输出用的片上LM内存，用来存放x+y的加法结果z
+   AscendC::LocalTensor<float> zLocal = outQueueZ.AllocTensor<float>();
+
+   AscendC::Add(zLocal,xLocal,yLocal,this->tileLength);
+
+   // 括号有实参zLocal，可自动推导，<float>可省略；教程这里写EnQue<float>只是为了可读性，非强制
+   outQueueZ.EnQue(zLocal);
+
+   // FreeTensor：输入x、y张量已经完成计算，不再使用，把片上内存归还回输入队列
+   InQueueX.FreeTensor(xLocal);
+   InQueueY.FreeTensor(yLocal);
+}
+
+__aicore__ inline void KernelAdd::CopyOut(uint32_t progress){
+   AscendC::LocalTensor<float> zLocal = outQueueZ.DeQue<float>();
+   // DataCopy：LM(片上内存) -> GM(全局显存)，把计算结果搬回全局内存，Host侧才能拿到结果
+   AscendC::DataCopy(zGm[progress*this->tileLength],zLocal,this->tileLength);
+   outQueueZ.FreeTensor(zLocal);
+}
+
+// 算子注册入口，CANN动态算子必须有这个
+REGISTER_KERNEL(KernelAdd, KernelAdd)
