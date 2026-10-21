@@ -1,0 +1,59 @@
+#include "kernel_operator.h"
+#include <cstdint>
+
+constexpr uint32_t TILE_LENGTH = 256;
+
+__global__ __vector__ void vector_static(GM_ADDR x, GM_ADDR y, GM_ADDR z, uint32_t totalLength)
+{
+    // TODO 1：入口调用 InitSocState，绑定当前核的三个 GlobalTensor。
+    AscendC::InitSocState();
+    const uint32_t blockLength=totalLength/AscendC::GetBlockNum();
+    const uint32_t blockOffset=blockLength*AscendC::GetBlockIdx();
+    AscendC::GlobalTensor<float> xGm,yGm,zGm;
+    xGm.SetGlobalTensor((__gm__ float*)x+blockOffset,blockLength);
+    yGm.SetGlobalTensor((__gm__ float*)y+blockOffset,blockLength);
+    zGm.SetGlobalTensor((__gm__ float*)z+blockOffset,blockLength);
+                        
+    // TODO 2：在循环外通过一个 UB LocalMemAllocator 分配 xLocal/yLocal/zLocal；
+    AscendC::LocalMemAllocator<AscnedC::HardWare::UB> ubAllocator;
+    AscendC::LocalTensor<float> xLocal=ubAllocator.Alloc<float,TILE_LENGTH>();
+    AscendC::LocalTensor<float> yLocal=ubAllocator.Alloc<float,TILE_LENGTH>();
+    AscendC::LocalTensor<float> zLocal=ubAllocator.Alloc<float,TILE_LENGTH>();
+
+    // TODO 3：循环内完成 DataCopy -> Sub -> DataCopy。
+    const uint32_t loopCount=blockLength/TILE_LENGTH;
+    for(uint32_t i=0;i<loopCount;i++){
+        const uint32_t offset=i*TILE_LENGTH;
+        if(i!=0){
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
+        }
+
+        AscendC::DataCopy(xLocal,xGm[offset],TILE_LENGTH);
+        AscendC::DataCopy(yLocal,yGm[offset],TILE_LENGTH);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+
+        if(i!=0){
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
+        }
+
+        AscendC::Add(zLocal,xLocal,yLocal,TILE_LENGTH);
+
+        if(i+1<loopCount){
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
+        }
+
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+        AscendC::DataCopy(zGm[offset],zLocal,TILE_LENGTH);
+
+        if(i+1<loopCount){
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
+        }
+    }
+    // TODO 4：补齐 MTE2_V、V_MTE3 以及跨轮 V_MTE2、MTE3_V 同步。
+    // TODO 5：退出前等待 PIPE_ALL。
+    AscendC::PipeBarrier<PIPE_ALL>();
+    // 完成实现后删除下一行；禁止使用 TPipe、TQue 或 TBuf 替代静态分配。
+#error "Complete the static Tensor Sub exercise before building"
+}
