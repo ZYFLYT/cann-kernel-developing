@@ -2,21 +2,21 @@
 #include "kernel_operator.h"
 
 // ==========================================
-// 1. 工业级 Tiling 结构体（满血版）
+// 1. 工业级 Tiling 结构体
 // ==========================================
 struct TilingDataTemplate {
     uint32_t smallCoreDataNum;   // 小核处理的总元素个数
     uint32_t bigCoreDataNum;     // 大核处理的总元素个数
     uint32_t finalBigTileNum;    // 大核循环次数
     uint32_t finalSmallTileNum;  // 小核循环次数
-    uint32_t tileDataNum;        // 单次最大搬运元素个数（由UB容量决定）
+    uint32_t tileDataNum;        // 单次最大搬运元素个数
     uint32_t smallTailDataNum;   // 小核最后一次循环处理个数
     uint32_t bigTailDataNum;     // 大核最后一次循环处理个数
     uint32_t tailBlockNum;       // 大核的个数
 };
 
 // ==========================================
-// 2. Device 侧核函数（完美处理大小核与尾块）
+// 2. Device 侧核函数（严格配对 Alloc/EnQue/DeQue/Free）
 // ==========================================
 __global__ __vector__ void add_custom(GM_ADDR x1, GM_ADDR x2, GM_ADDR y, TilingDataTemplate tiling)
 {
@@ -26,7 +26,7 @@ __global__ __vector__ void add_custom(GM_ADDR x1, GM_ADDR x2, GM_ADDR y, TilingD
     uint32_t loopCount = 0;
     uint32_t lastTileDataNum = 0;
 
-    // 判断当前是大核还是小核
+    // 判断当前是大核还是小核，并计算偏移量
     if (blockIdx < tiling.tailBlockNum) {
         // 我是大核
         offset = blockIdx * tiling.bigCoreDataNum;
@@ -50,7 +50,7 @@ __global__ __vector__ void add_custom(GM_ADDR x1, GM_ADDR x2, GM_ADDR y, TilingD
     x2Gm.SetGlobalBuffer((__gm__ float*)x2 + offset, currentCoreDataNum);
     yGm.SetGlobalBuffer((__gm__ float*)y + offset, currentCoreDataNum);
 
-    // 初始化流水线
+    // 初始化流水线 (单缓冲模式)
     AscendC::TPipe pipe;
     AscendC::TQue<AscendC::TPosition::VECIN, 1> inQueueX1, inQueueX2;
     AscendC::TQue<AscendC::TPosition::VECOUT, 1> outQueueY;
@@ -59,40 +59,51 @@ __global__ __vector__ void add_custom(GM_ADDR x1, GM_ADDR x2, GM_ADDR y, TilingD
     pipe.InitBuffer(inQueueX2, 1, tiling.tileDataNum * sizeof(float));
     pipe.InitBuffer(outQueueY, 1, tiling.tileDataNum * sizeof(float));
 
-    // 开始循环
+    // 开始循环 (严格流水线)
     for (uint32_t i = 0; i < loopCount; ++i) {
         uint32_t tileOffset = i * tiling.tileDataNum;
-        // 判断是不是最后一次循环（如果是，用尾块长度）
         uint32_t currentTileLength = (i == loopCount - 1) ? lastTileDataNum : tiling.tileDataNum;
 
         if (currentTileLength <= 0) continue;
 
-        // 搬入
+        // ================= 搬入阶段 =================
         AscendC::LocalTensor<float> x1Local = inQueueX1.AllocTensor<float>();
         AscendC::LocalTensor<float> x2Local = inQueueX2.AllocTensor<float>();
+        
         AscendC::DataCopy(x1Local, x1Gm[tileOffset], currentTileLength);
         AscendC::DataCopy(x2Local, x2Gm[tileOffset], currentTileLength);
+        
         inQueueX1.EnQue(x1Local);
         inQueueX2.EnQue(x2Local);
 
-        // 计算
+        // ================= 计算阶段 =================
+        // 正确使用 DeQue 等待数据就绪
+        AscendC::LocalTensor<float> x1Ready = inQueueX1.DeQue<float>();
+        AscendC::LocalTensor<float> x2Ready = inQueueX2.DeQue<float>();
+        
         AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
-        AscendC::Add(yLocal, x1Local, x2Local, currentTileLength);
+        
+        // 执行加法
+        AscendC::Add(yLocal, x1Ready, x2Ready, currentTileLength);
+        
         outQueueY.EnQue(yLocal);
-
+        
         // 释放输入
-        inQueueX1.FreeTensor(x1Local);
-        inQueueX2.FreeTensor(x2Local);
+        inQueueX1.FreeTensor(x1Ready);
+        inQueueX2.FreeTensor(x2Ready);
 
-        // 搬出
-        AscendC::LocalTensor<float> yOutLocal = outQueueY.DeQue<float>();
-        AscendC::DataCopy(yGm[tileOffset], yOutLocal, currentTileLength);
-        outQueueY.FreeTensor(yLocal); // 注意这里释放的是 yOutLocal 对应的 Tensor
+        // ================= 搬出阶段 =================
+        // 正确使用 DeQue 等待计算完成
+        AscendC::LocalTensor<float> yReady = outQueueY.DeQue<float>();
+        
+        AscendC::DataCopy(yGm[tileOffset], yReady, currentTileLength);
+        
+        outQueueY.FreeTensor(yReady);
     }
 }
 
 // ==========================================
-// 3. Host 侧入口（实现截图里的核心计算逻辑）
+// 3. Host 侧入口（最稳妥的元素级大小核均分）
 // ==========================================
 extern "C" void run_kernel(
     GM_ADDR x1, const TensorGroupInfo& info_x1, 
@@ -101,50 +112,44 @@ extern "C" void run_kernel(
     int64_t availableCoreNum, 
     aclrtStream stream)
 {
-    // 1. 获取总元素个数
+    // 计算总元素个数
     uint32_t totalLength = 1;
     for (int i = 0; i < info_x1.tensors[0].numDims; ++i) {
         totalLength *= info_x1.tensors[0].shape[i];
     }
     if (totalLength == 0) return;
 
-    // 2. 设定单次处理的元素个数（保守设定，防止 UB 越界）
-    // 假设浮点型，一个块 256 个元素
-    uint32_t tileDataNum = 4096; 
-
-    // 3. 计算总共需要多少块（向上取整）
-    uint32_t totalBlockNum = (totalLength + tileDataNum - 1) / tileDataNum;
-
-    // 4. 计算实际使用的核数
+    // 确定核数与单次搬运量
     uint32_t blockNum = availableCoreNum;
-    if (blockNum > totalBlockNum) {
-        blockNum = totalBlockNum; // 数据太少，不用开那么多核
-    }
+    if (blockNum > totalLength) blockNum = totalLength; // 数据太少，不用开那么多核
+    
+    uint32_t tileDataNum = 4096; // 保守值，绝对不爆 UB
 
-    // 5. 计算大小核分配
-    uint32_t everyCoreBlockNum = totalBlockNum / blockNum; // 基础块数
-    uint32_t tailBlockNum = totalBlockNum % blockNum;      // 余数（大核数量）
+    // 按元素均分，完美避开尾块越界问题
+    uint32_t everyCoreDataNum = totalLength / blockNum; // 小核拿的基础量
+    uint32_t tailCoreNum = totalLength % blockNum;      // 大核数量（余数分给前面）
 
     TilingDataTemplate tiling;
-    tiling.tailBlockNum = tailBlockNum;
+    tiling.tailBlockNum = tailCoreNum;
     tiling.tileDataNum = tileDataNum;
 
-    // 计算大核参数
-    tiling.bigCoreDataNum = (everyCoreBlockNum + 1) * tileDataNum;
-    tiling.finalBigTileNum = everyCoreBlockNum + 1;
-    tiling.bigTailDataNum = tileDataNum; // 大核全满，无空余（数据量不对齐的情况暂不深入处理）
+    // 计算大核参数（多拿 1 个元素）
+    tiling.bigCoreDataNum = everyCoreDataNum + 1;
+    tiling.finalBigTileNum = (tiling.bigCoreDataNum + tileDataNum - 1) / tileDataNum;
+    tiling.bigTailDataNum = tiling.bigCoreDataNum % tileDataNum;
+    if (tiling.bigTailDataNum == 0) tiling.bigTailDataNum = tileDataNum;
 
     // 计算小核参数
-    if (blockNum > tailBlockNum) {
-        tiling.smallCoreDataNum = everyCoreBlockNum * tileDataNum;
-        tiling.finalSmallTileNum = everyCoreBlockNum;
-        tiling.smallTailDataNum = tileDataNum;
+    tiling.smallCoreDataNum = everyCoreDataNum;
+    if (tiling.smallCoreDataNum > 0) {
+        tiling.finalSmallTileNum = (tiling.smallCoreDataNum + tileDataNum - 1) / tileDataNum;
+        tiling.smallTailDataNum = tiling.smallCoreDataNum % tileDataNum;
+        if (tiling.smallTailDataNum == 0) tiling.smallTailDataNum = tileDataNum;
     } else {
-        tiling.smallCoreDataNum = 0;
         tiling.finalSmallTileNum = 0;
         tiling.smallTailDataNum = 0;
     }
 
-    // 6. 启动核函数
+    // 启动核函数
     add_custom<<<blockNum, nullptr, stream>>>(x1, x2, y, tiling);
 }
